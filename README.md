@@ -11,12 +11,21 @@
 | 路径 | 网址 | 说明 |
 | --- | --- | --- |
 | `blog_src/` | — | **你写文章的地方**，只放 `.md` 文件 |
-| `blog/` | `/blog/` | 脚本自动生成的网页，**不要手动改** |
-| `shuangpin-practice/` | `/blog/shuangpin-practice/` | 双拼练习小站 |
+| `index.html`、`about.html`、`posts/`、`style.css`、`feed.xml` | `/blog/…` | 脚本自动生成的网页，**不要手动改** |
+| `shuangpin-practice/` | `/blog/shuangpin-practice/` | 双拼练习小站（手工维护） |
 | `tools/` | — | 构建和发布脚本 |
 
 > 仓库名必须正好是 `blog`，网址才会是 `/blog/`。GitHub Pages 的规则是
-> `用户名.github.io/仓库名/`，所以这条路径由仓库名决定。
+> `用户名.github.io/仓库名/`，所以这条路径由仓库名决定，**也正因如此
+> `index.html` 必须在仓库根目录**——它被放进子目录的话，`/blog/` 就会 404。
+
+### 哪些是生成出来的
+
+构建脚本会把自己写过的路径记在 `tools/.blog-manifest.json` 里，
+下次构建时清理掉「上一轮生成、这一轮不再需要」的文件（比如你删掉一篇文章后的旧网页）。
+**它只删清单里记过的路径**，不会碰你手工添加的东西。
+
+`blog_src/`、`shuangpin-practice/`、`tools/` 以及 `README.md` 都是手工维护的，脚本不会动。
 
 ## 写一篇新文章
 
@@ -39,7 +48,7 @@
 | 文件 | 用途 |
 | --- | --- |
 | `tools/build-blog.bat` | 只生成网页，不发布 |
-| `tools/preview-blog.bat` | 本地预览，浏览器打开 `http://localhost:8000/blog/` |
+| `tools/preview-blog.bat` | 本地预览，浏览器打开 `http://localhost:8000/` |
 | `tools/publish-blog.bat` | 生成 + 提交 + 推送到 GitHub |
 
 ## 推送机制（重要）

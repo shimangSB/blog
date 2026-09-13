@@ -15,9 +15,9 @@ if errorlevel 1 (
 )
 
 echo.
-echo 正在打开浏览器 http://localhost:8000/blog/
+echo 正在打开浏览器 http://localhost:8000/
 echo 预览期间请不要关闭这个黑窗口。看完按 Ctrl+C 或直接关掉窗口。
 echo.
 
-start "" http://localhost:8000/blog/
+start "" http://localhost:8000/
 python -m http.server 8000
