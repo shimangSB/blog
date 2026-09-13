@@ -16,9 +16,9 @@
 import argparse
 import datetime as _dt
 import html
+import json
 import os
 import re
-import shutil
 import sys
 
 # ---------------------------------------------------------------- 控制台编码
@@ -41,20 +41,28 @@ SITE_URL = "https://shimangsb.github.io/blog"
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_DIR = os.path.join(ROOT, "blog_src")
-BLOG_DIR = os.path.join(ROOT, "blog")
+
+# 博客网页直接生成在仓库根目录。
+# 原因：仓库叫 blog，Pages 的网址是 用户名.github.io/blog/，
+# 也就是「仓库根 = /blog/」。想让 /blog/ 打开博客首页，
+# index.html 就必须在仓库根，不能塞进 blog/ 子目录。
+BLOG_DIR = ROOT
 POSTS_DIR = os.path.join(BLOG_DIR, "posts")
 
-# 双拼站首页。目录结构是按最终网址排的：
-#   仓库 blog/  ->  https://shimangsb.github.io/blog/
-#   shuangpin-practice/ 子目录  ->  .../blog/shuangpin-practice/
-# 所以从 blog/ 往上一级就是站点根，双拼站在 shuangpin-practice/。
-HOME_URL = "../shuangpin-practice/"
+# 构建产物的路径清单，用于清掉上一轮生成、这一轮不再需要的文件。
+# 放在 tools/ 下，避免污染站点根目录。
+MANIFEST = os.path.join(ROOT, "tools", ".blog-manifest.json")
+
+# 双拼站首页。目录结构按最终网址排布：
+#   仓库根         ->  https://shimangsb.github.io/blog/
+#   shuangpin-practice/  ->  .../blog/shuangpin-practice/
+HOME_URL = "shuangpin-practice/"
 
 # 关于页内容：改这里就能改「关于」页
 ABOUT_CONTENT = """<h1>关于</h1>
 <p class="page-intro">这是个写东西的地方。</p>
 <p>主要会写双拼、输入法、小鹤音形相关的内容，也会记录做
-<a href="../shuangpin-practice/">双拼练习</a>这个小站时踩过的坑。</p>
+<a href="shuangpin-practice/">双拼练习</a>这个小站时踩过的坑。</p>
 <h2>关于我</h2>
 <p>业余折腾键盘和输入法，喜欢把用起来不顺手的东西自己重做一遍。</p>
 <h2>关于这个站</h2>
@@ -774,10 +782,56 @@ def read_posts():
 
 # ---------------------------------------------------------------- 生成
 
+# 本次构建实际写出的文件（相对仓库根），用于生成产物清单
+_generated = []
+
+
 def write(path, content):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(content)
+    rel = os.path.relpath(path, ROOT).replace("\\", "/")
+    if rel not in _generated:
+        _generated.append(rel)
+
+
+def _read_manifest():
+    """读上一轮构建的产物清单。"""
+    try:
+        with open(MANIFEST, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.get("generated", []))
+    except Exception:
+        return set()
+
+
+def _save_manifest():
+    os.makedirs(os.path.dirname(MANIFEST), exist_ok=True)
+    with open(MANIFEST, "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"generated": sorted(_generated)}, f, ensure_ascii=False, indent=2)
+
+
+def _clean_stale(previous):
+    """删掉上一轮生成、这一轮不再需要的文件。
+
+    只删清单里记过的路径，绝不碰你没让脚本生成的东西。
+    这样删掉一篇文章后，对应的网页不会残留在站点里。
+    """
+    removed = []
+    for rel in sorted(previous - set(_generated)):
+        full = os.path.join(ROOT, rel)
+        # 安全兜底：只删仓库内的文件，且必须在清单里
+        if os.path.isfile(full) and os.path.abspath(full).startswith(os.path.abspath(ROOT)):
+            os.remove(full)
+            removed.append(rel)
+            # 顺手清掉空掉的目录
+            parent = os.path.dirname(full)
+            try:
+                if os.path.isdir(parent) and not os.listdir(parent):
+                    os.rmdir(parent)
+            except OSError:
+                pass
+    return removed
 
 
 def build(check_only=False):
@@ -789,10 +843,8 @@ def build(check_only=False):
     for p in drafts:
         print("  · 草稿（不会发布）：%s" % p["title"])
 
+    previous = _read_manifest() if not check_only else set()
     if not check_only:
-        # 清掉旧的 posts/，避免删掉文章后网页还留着
-        if os.path.isdir(POSTS_DIR):
-            shutil.rmtree(POSTS_DIR)
         os.makedirs(POSTS_DIR, exist_ok=True)
         # 样式表也由脚本生成，改样式只需要改这个脚本里的 CSS_CONTENT
         write(os.path.join(BLOG_DIR, "style.css"), CSS_CONTENT)
@@ -903,16 +955,22 @@ def build(check_only=False):
         # GitHub Pages 会默认拿 Jekyll 处理站点；博客是纯静态的，关掉更稳
         write(os.path.join(ROOT, ".nojekyll"), "")
 
+        # 清掉上一轮生成、这一轮不再需要的文件，并记下本轮产物
+        removed = _clean_stale(previous)
+        for rel in removed:
+            print("  清理  %s" % rel)
+        _save_manifest()
+
     print("\n[完成] 网页已生成")
     if not check_only:
-        print("   网页位置：blog/")
+        print("   网页位置：仓库根目录（index.html / posts/ / style.css / feed.xml）")
         print("   本地预览：双击 tools/preview-blog.bat")
         print("   发布上线：双击 tools/publish-blog.bat")
     return 0
 
 
 def main():
-    ap = argparse.ArgumentParser(description="把 blog_src/*.md 生成到 blog/")
+    ap = argparse.ArgumentParser(description="把 blog_src/*.md 生成到仓库根目录")
     ap.add_argument("--check", action="store_true", help="只检查，不写文件")
     args = ap.parse_args()
     return build(check_only=args.check)
