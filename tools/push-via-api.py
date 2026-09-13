@@ -67,10 +67,21 @@ print("认证成功：%s" % me.get("login"))
 
 # ---------- 2. 读取本地要推的提交 ----------
 head = git("rev-parse", "HEAD").decode().strip()
-parent = git("rev-parse", "HEAD^").decode().strip()
 message = git("log", "-1", "--format=%B").decode().rstrip("\n")
+if "--all" in sys.argv:
+    message = "chore: 补全仓库完整内容（初始推送只带了差异文件）"
+
+# 判断是不是根提交（仓库第一次推送时没有父提交）
+parent_probe = subprocess.run(["git", "rev-parse", "--verify", "--quiet", "HEAD^"],
+                              capture_output=True)
+IS_ROOT = parent_probe.returncode != 0
+parent = "" if IS_ROOT else parent_probe.stdout.decode().strip()
+
 print("本地 HEAD: %s" % head[:10])
-print("父提交   : %s" % parent[:10])
+if IS_ROOT:
+    print("父提交   : （根提交，这是首次推送）")
+else:
+    print("父提交   : %s" % parent[:10])
 
 # ---------- 3. 确认远程当前位置 ----------
 # --overwrite：用于修正上一次推错内容的情况（把分支强制指到本地这个提交）
@@ -85,7 +96,7 @@ if status == 200:
     if remote_sha == head:
         print("远程已经是这个提交了，无需推送。")
         sys.exit(0)
-    if remote_sha != parent:
+    if remote_sha != parent and not IS_ROOT:
         if OVERWRITE:
             # 用远程当前位置当父提交：这样是一个正常的快进提交，
             # 而不是真的强推（API 也会校验父提交是否存在）
@@ -95,29 +106,61 @@ if status == 200:
             print("远程位置和本地父提交不一致，为避免覆盖别人的改动，已中止。")
             print("如果确认是要修正上一次推错的内容，加 --overwrite 再跑一次。")
             sys.exit(1)
-elif status == 404:
-    print("远程还没有 %s 分支，将新建。" % BRANCH)
+    elif IS_ROOT:
+        print("本地是根提交，将以远程当前位置为父提交（这是首次推送）。")
+        base_parent = remote_sha
+elif status in (404, 409):
+    # 404 = 分支不存在；409 = 仓库为空（GitHub 对空仓库返回 409）
+    print("远程还没有 %s 分支，将新建（HTTP %d）。" % (BRANCH, status))
 else:
     print("读取远程分支失败：HTTP %d %s" % (status, ref))
     sys.exit(1)
 
-# ---------- 4. 收集本次提交新增/修改的文件 ----------
-diff = git("diff", "--name-status", parent, head).decode("utf-8")
-entries = []
-for line in diff.splitlines():
-    if not line.strip():
-        continue
-    parts = line.split("\t")
-    state = parts[0]
-    if state.startswith("D"):
-        entries.append((parts[1], None))
-    elif state.startswith("R"):
-        entries.append((parts[1], None))   # 旧路径删除
-        entries.append((parts[2], "keep"))  # 新路径稍后读
-    else:
-        entries.append((parts[1], "keep"))
+# ---------- 4. 收集本次要推的文件 ----------
+# --all：推完整的工作树（用于首次推送到空仓库，或修正远程内容不全的情况）
+ALL = "--all" in sys.argv
 
-print("本次提交涉及 %d 个文件" % len(entries))
+entries = []
+if ALL:
+    tracked = git("ls-tree", "-r", "--name-only", head).decode("utf-8")
+    for line in tracked.splitlines():
+        if line.strip():
+            entries.append((line.strip(), "keep"))
+    print("--all 模式：将上传本地全部 %d 个文件" % len(entries))
+elif IS_ROOT:
+    # 根提交：整个仓库都是新增的，取当前提交里的全部文件
+    tracked = git("ls-tree", "-r", "--name-only", head).decode("utf-8")
+    for line in tracked.splitlines():
+        if line.strip():
+            entries.append((line.strip(), "keep"))
+    print("根提交：将上传全部 %d 个文件" % len(entries))
+else:
+    diff = git("diff", "--name-status", parent, head).decode("utf-8")
+    for line in diff.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        state = parts[0]
+        if state.startswith("D"):
+            entries.append((parts[1], None))
+        elif state.startswith("R"):
+            entries.append((parts[1], None))    # 旧路径删除
+            entries.append((parts[2], "keep"))  # 新路径稍后读
+        else:
+            entries.append((parts[1], "keep"))
+    print("本次提交涉及 %d 个文件" % len(entries))
+
+# --all 模式下，把远程有、本地没有的文件也显式删掉，保证两边完全一致
+if ALL and base_parent:
+    local_paths = set(p for p, a in entries)
+    st, rc = api("GET", "/repos/%s/git/trees/%s?recursive=1" % (REPO, base_parent))
+    if st == 200:
+        remote_paths = set(x["path"] for x in rc.get("tree", []) if x["type"] == "blob")
+        for p in sorted(remote_paths - local_paths):
+            entries.append((p, None))
+            print("  删除多余的远程文件  %s" % p)
+    else:
+        print("读取远程 tree 失败：HTTP %d" % st)
 
 # ---------- 5. 上传 blob ----------
 tree_items = []
@@ -149,28 +192,31 @@ for path, action in entries:
 # 注意 base 必须是「远程的 tree」，和下面 commit 的父提交保持一致，
 # 否则建出来的 tree 会丢掉对方那边已有的文件。
 # 远程提交对象本地可能没有（推完没 fetch 过），所以通过 API 查它的 tree sha。
-if base_parent == parent:
-    remote_tree = git("rev-parse", "%s^{tree}" % base_parent).decode().strip()
+tree_payload = {"tree": tree_items}
+if base_parent:
+    if base_parent == parent:
+        remote_tree = git("rev-parse", "%s^{tree}" % base_parent).decode().strip()
+    else:
+        status, rc = api("GET", "/repos/%s/git/commits/%s" % (REPO, base_parent))
+        if status != 200:
+            print("读取远程提交失败：HTTP %d %s" % (status, rc.get("message")))
+            sys.exit(1)
+        remote_tree = rc["tree"]["sha"]
+        print("远程 tree: %s" % remote_tree[:10])
+    tree_payload["base_tree"] = remote_tree
 else:
-    status, rc = api("GET", "/repos/%s/git/commits/%s" % (REPO, base_parent))
-    if status != 200:
-        print("读取远程提交失败：HTTP %d %s" % (status, rc.get("message")))
-        sys.exit(1)
-    remote_tree = rc["tree"]["sha"]
-    print("远程 tree: %s" % remote_tree[:10])
+    print("无父提交，按完整 tree 提交（首次推送）")
 
-status, tree = api("POST", "/repos/%s/git/trees" % REPO,
-                   {"base_tree": remote_tree, "tree": tree_items})
+status, tree = api("POST", "/repos/%s/git/trees" % REPO, tree_payload)
 if status not in (200, 201):
     print("建 tree 失败：HTTP %d %s" % (status, tree.get("message")))
     sys.exit(1)
 
 # ---------- 7. 建 commit ----------
-status, commit = api("POST", "/repos/%s/git/commits" % REPO, {
-    "message": message,
-    "tree": tree["sha"],
-    "parents": [base_parent],
-})
+commit_payload = {"message": message, "tree": tree["sha"]}
+if base_parent:
+    commit_payload["parents"] = [base_parent]
+status, commit = api("POST", "/repos/%s/git/commits" % REPO, commit_payload)
 if status not in (200, 201):
     print("建 commit 失败：HTTP %d %s" % (status, commit.get("message")))
     sys.exit(1)
